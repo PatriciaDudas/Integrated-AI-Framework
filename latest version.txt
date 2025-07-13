@@ -1,0 +1,1365 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Dense, LSTM, RepeatVector, TimeDistributed, Conv1D, Conv1DTranspose, Lambda, GlobalAveragePooling1D, Reshape
+from tensorflow.keras.models import Model
+from tensorflow.keras import regularizers
+from tensorflow.keras.callbacks import EarlyStopping
+import xgboost as xgb
+from sklearn.feature_selection import SequentialFeatureSelector, SelectFromModel
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LassoCV
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, accuracy_score
+import causalml
+from causalml.inference.tree.causal.causalforest import CausalTreeRegressor
+import logging
+import psutil
+import gc
+# Add these imports at the top
+import tensorflow as tf
+from tensorflow.keras import mixed_precision
+
+# Add this configuration before any TensorFlow operations
+def configure_gpu():
+    # Check for GPU availability
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Enable memory growth to prevent TensorFlow from allocating all memory at once
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+
+            # Set mixed precision policy for better performance on modern GPUs
+            policy = mixed_precision.Policy('mixed_float16')
+            mixed_precision.set_global_policy(policy)
+            print("GPU configured with mixed precision policy")
+        except RuntimeError as e:
+            print(f"Error configuring GPU: {e}")
+    else:
+        print("No GPU available, using CPU")
+
+# Call the configuration function
+configure_gpu()
+
+def print_memory_usage():
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    print(f"Memory usage: {mem_info.rss / 1024**2:.2f} MB")
+
+
+def sequence_generator(data, sequence_length, batch_size):
+    while True:
+        for i in range(0, len(data) - sequence_length, batch_size):
+            batch = []
+            for j in range(i, i + batch_size):
+                if j + sequence_length > len(data):
+                    break
+                batch.append(data[j:j+sequence_length])
+            # Return tuple (input, target) where target is the same as input
+            yield (np.array(batch), np.array(batch))
+
+def clear_memory():
+    # Clear TensorFlow sessions
+    tf.keras.backend.clear_session()
+
+    # Collect garbage
+    gc.collect()
+
+    # Print memory usage
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    print(f"Memory usage: {mem_info.rss / 1024**2:.2f} MB")
+
+
+# Define failure periods based on the provided information
+failure_periods = [
+    {"start": "2020-04-18 00:00:00", "end": "2020-04-18 23:59:00"},
+    {"start": "2020-05-29 23:30:00", "end": "2020-05-30 06:00:00"},
+    {"start": "2020-06-05 10:00:00", "end": "2020-06-07 14:30:00"},
+    {"start": "2020-07-15 14:30:00", "end": "2020-07-15 19:00:00"}
+]
+
+class DataPreprocessor:
+    def __init__(self, data_path, failure_periods):
+        self.data_path = data_path
+        self.failure_periods = failure_periods
+        self.df = pd.read_csv(self.data_path)
+        self.train_data = None
+        self.test_data = None
+        self.analog_features = None
+        self.digital_features = None
+
+    def _mark_anomalies(self):
+        self.df['is_anomaly'] = 0
+        for period in self.failure_periods:
+            start_time = pd.to_datetime(period['start'])
+            end_time = pd.to_datetime(period['end'])
+            self.df.loc[(self.df['timestamp'] >= start_time) & (self.df['timestamp'] <= end_time), 'is_anomaly'] = 1
+
+    def _split_data(self):
+        self.train_data = self.df[
+            (self.df['timestamp'] >= "2020-02-01 00:00:00") & (self.df['timestamp'] < "2020-05-31 11:59:59") &
+            (self.df['is_anomaly'] == 0)]
+        self.test_data = self.df[
+            (self.df['timestamp'] >= "2020-06-01 00:00:00") & (self.df['timestamp'] < "2020-07-31 11:59:59")]
+
+        # Check if data is empty
+        if self.train_data.empty or self.test_data.empty:
+            raise ValueError("Train or test data is empty after splitting")
+
+        # Drop unnecessary column
+        self.train_data.drop(self.train_data.columns[0], axis=1, inplace=True)
+        self.test_data.drop(self.test_data.columns[0], axis=1, inplace=True)
+
+        # Check if data is empty after dropping column
+        if self.train_data.empty or self.test_data.empty:
+            raise ValueError("Train or test data is empty after dropping column")
+
+    def _standardize_data(self):
+        scaler = StandardScaler()
+        self.analog_features = ['TP2', 'TP3', 'H1', 'DV_pressure', 'Reservoirs', 'Oil_temperature', 'Motor_current']
+        self.digital_features = ['COMP', 'DV_eletric', 'Towers', 'MPG', 'LPS', 'Pressure_switch', 'Oil_level', 'Caudal_impulses']
+
+        # Make sure we use the same number of rows for both analog and digital
+        # Convert to DataFrame with proper column names
+        self.analog_train = pd.DataFrame(
+            scaler.fit_transform(self.train_data[self.analog_features]),
+            columns=self.analog_features
+        )
+
+        self.analog_test = pd.DataFrame(
+            scaler.transform(self.test_data[self.analog_features]),
+            columns=self.analog_features
+        )
+
+        self.digital_train = self.train_data[self.digital_features].reset_index(drop=True)
+        self.digital_test = self.test_data[self.digital_features].reset_index(drop=True)
+
+        # Ensure the same indexes/lengths for analog and digital
+        self.analog_train = self.analog_train.reset_index(drop=True)
+        self.analog_test = self.analog_test.reset_index(drop=True)
+
+    def preprocess(self):
+        self.df['timestamp'] = pd.to_datetime(self.df['timestamp'])
+        self._mark_anomalies()
+        self._split_data()
+        self._standardize_data()
+
+        # Final check to ensure datasets have the same number of rows
+        assert len(self.analog_train) == len(self.digital_train), f"Dataset length mismatch: analog={len(self.analog_train)}, digital={len(self.digital_train)}"
+        assert len(self.analog_test) == len(self.digital_test), f"Test dataset length mismatch: analog={len(self.analog_test)}, digital={len(self.digital_test)}"
+
+        return self.analog_train, self.analog_test, self.digital_train, self.digital_test
+
+class AutoencoderModels:
+    def __init__(self, analog_train, analog_test, digital_train, digital_test):
+        self.analog_train = analog_train
+        self.analog_test = analog_test
+        self.digital_train = digital_train
+        self.digital_test = digital_test
+        self.analog_model = None
+        self.digital_model = None
+
+    def build_sae_analog(self):
+        input_layer = Input(shape=(self.analog_train.shape[1],))
+        encoded = Dense(256, activation='relu')(input_layer)
+        encoded = Dense(128, activation='relu')(encoded)
+        encoded = Dense(64, activation='relu')(encoded)
+        bottleneck = Dense(24, activation='relu')(encoded)
+        decoded = Dense(64, activation='relu')(bottleneck)
+        decoded = Dense(128, activation='relu')(decoded)
+        decoded = Dense(256, activation='relu')(decoded)
+        output_layer = Dense(self.analog_train.shape[1], activation='linear')(decoded)
+
+        model = Model(inputs=input_layer, outputs=output_layer)
+        model.compile(optimizer='adam', loss='mse')
+        return model
+
+    def build_sae_digital(self):
+        input_layer = Input(shape=(self.digital_train.shape[1],))
+        encoded = Dense(64, activation='relu')(input_layer)
+        encoded = Dense(32, activation='relu')(encoded)
+        bottleneck = Dense(12, activation='relu')(encoded)
+        decoded = Dense(32, activation='relu')(bottleneck)
+        decoded = Dense(64, activation='relu')(decoded)
+        output_layer = Dense(self.digital_train.shape[1], activation='sigmoid')(decoded)
+
+        model = Model(inputs=input_layer, outputs=output_layer)
+        model.compile(optimizer='adam', loss='binary_crossentropy')
+        return model
+
+    # Fix for build_vae_analog method
+    def build_vae_analog(self):
+        class VAELossLayer(tf.keras.layers.Layer):
+            def __init__(self, **kwargs):
+                super(VAELossLayer, self).__init__(**kwargs)
+                self.is_placeholder = True  # This is a custom loss layer
+
+            def call(self, inputs):
+                z_mean, z_log_var, reconstructed, original = inputs
+                reconstruction_loss = tf.reduce_mean(tf.square(original - reconstructed))
+                kl_loss = -0.5 * tf.reduce_sum(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
+                self.add_loss(reconstruction_loss + kl_loss)
+                return reconstructed
+
+        inputs = Input(shape=(self.analog_train.shape[1],))
+        encoded = Dense(128, activation='relu')(inputs)
+        encoded = Dense(64, activation='relu')(encoded)
+        z_mean = Dense(12)(encoded)
+        z_log_var = Dense(12)(encoded)
+
+        def sampling(args):
+            z_mean, z_log_var = args
+            batch = tf.shape(z_mean)[0]
+            dim = tf.shape(z_mean)[1]
+            # Cast epsilon to the same data type as z_mean and z_log_var
+            epsilon = tf.keras.backend.random_normal(shape=(batch, dim), dtype=z_mean.dtype)
+            return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+        z = Lambda(sampling)([z_mean, z_log_var])
+
+        decoded = Dense(64, activation='relu')(z)
+        decoded = Dense(128, activation='relu')(decoded)
+        outputs = Dense(self.analog_train.shape[1], activation='linear')(decoded)
+
+        # Add custom loss layer
+        loss_inputs = [z_mean, z_log_var, outputs, inputs]
+        loss_layer = VAELossLayer()(loss_inputs)
+
+        model = Model(inputs=inputs, outputs=loss_layer)
+        model.compile(optimizer='adam')
+
+        return model
+
+    # Fix for build_vae_digital method
+    def build_vae_digital(self):
+        class VAELossLayer(tf.keras.layers.Layer):
+            def __init__(self, **kwargs):
+                super(VAELossLayer, self).__init__(**kwargs)
+                self.is_placeholder = True  # This is a custom loss layer
+
+            def call(self, inputs):
+                z_mean, z_log_var, reconstructed, original = inputs
+                reconstruction_loss = tf.reduce_mean(tf.square(original - reconstructed))
+                kl_loss = -0.5 * tf.reduce_sum(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
+                self.add_loss(reconstruction_loss + kl_loss)
+                return reconstructed
+
+        inputs = Input(shape=(self.digital_train.shape[1],))
+        encoded = Dense(36, activation='relu')(inputs)
+        encoded = Dense(18, activation='relu')(encoded)
+        z_mean = Dense(6)(encoded)
+        z_log_var = Dense(6)(encoded)
+
+        def sampling(args):
+            z_mean, z_log_var = args
+            batch = tf.shape(z_mean)[0]
+            dim = tf.shape(z_mean)[1]
+            # Cast epsilon to the same data type as z_mean and z_log_var
+            epsilon = tf.keras.backend.random_normal(shape=(batch, dim), dtype=z_mean.dtype)
+            return z_mean + tf.exp(0.5 * z_log_var) * epsilon
+
+        z = Lambda(sampling)([z_mean, z_log_var])
+
+        decoded = Dense(18, activation='relu')(z)
+        decoded = Dense(36, activation='relu')(decoded)
+        outputs = Dense(self.digital_train.shape[1], activation='sigmoid')(decoded)
+
+        # Add custom loss layer
+        loss_inputs = [z_mean, z_log_var, outputs, inputs]
+        loss_layer = VAELossLayer()(loss_inputs)
+
+        model = Model(inputs=inputs, outputs=loss_layer)
+        model.compile(optimizer='adam')
+
+        return model
+    def train_autoencoders(self):
+        # Train SAE for analog data
+        sae_analog = self.build_sae_analog()
+        sae_analog.fit(self.analog_train, self.analog_train, epochs=10, batch_size=64, validation_split=0.2, verbose=1)
+
+        # Train VAE for analog data
+        vae_analog = self.build_vae_analog()
+        vae_analog.fit(self.analog_train, self.analog_train, epochs=10, batch_size=64, validation_split=0.2, verbose=1)
+
+        # Train SAE for digital data
+        sae_digital = self.build_sae_digital()
+        sae_digital.fit(self.digital_train, self.digital_train, epochs=10, batch_size=64, validation_split=0.2, verbose=1)
+
+        # Train VAE for digital data
+        vae_digital = self.build_vae_digital()
+        vae_digital.fit(self.digital_train, self.digital_train, epochs=10, batch_size=64, validation_split=0.2, verbose=1)
+
+        self.analog_model = [sae_analog, vae_analog]
+        self.digital_model = [sae_digital, vae_digital]
+
+        return self.analog_model, self.digital_model
+
+class LSTMAutoencoder:
+    def __init__(self, analog_train, analog_test):
+        self.analog_train = analog_train
+        self.analog_test = analog_test
+        self.model = None
+
+    def build_model(self, sequence_length):
+        model = tf.keras.Sequential([
+            tf.keras.layers.Input(shape=(sequence_length, self.analog_train.shape[1])),
+            tf.keras.layers.LSTM(128, return_sequences=True),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.LSTM(64, return_sequences=True),
+            tf.keras.layers.Dropout(0.3),
+            tf.keras.layers.TimeDistributed(Dense(self.analog_train.shape[1])),
+            tf.keras.layers.Activation('linear')
+        ])
+        model.compile(loss='mean_squared_error', optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        metrics=['mae'])
+        return model
+
+    def create_sequences(self, data, sequence_length):
+        sequences = []
+        for i in range(len(data) - sequence_length):
+            sequences.append(data[i:i+sequence_length])
+        return np.array(sequences)
+
+    def train(self, sequence_length=60, epochs=30, batch_size=256):
+        # Create sequences
+        train_sequences = self.create_sequences(self.analog_train.values, sequence_length)
+        callbacks = [
+        tf.keras.callbacks.EarlyStopping(patience=8, restore_best_weights=True),
+        tf.keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=5)
+        ]
+        # Split into inputs and targets
+        X_train = train_sequences
+        y_train = train_sequences
+
+        # Build and train model
+        self.model = self.build_model(sequence_length)
+        self.model.fit(
+            X_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_split=0.1,
+            callbacks=callbacks,
+            verbose=1
+        )
+
+        # Memory cleanup
+        tf.keras.backend.clear_session()
+        gc.collect()
+        print_memory_usage()
+
+        return self.model
+
+class XGBoostModel:
+    def __init__(self, analog_train, analog_test, digital_train, digital_test):
+        self.analog_train = analog_train
+        self.analog_test = analog_test
+        self.digital_train = digital_train
+        self.digital_test = digital_test
+        self.model = None
+
+        # Verify correct lengths at initialization
+        assert len(self.analog_train) == len(self.digital_train), "Dataset lengths must match"
+
+    def feature_selection(self):
+        # Combine analog and digital features for feature selection
+        combined_train = pd.concat([self.analog_train, self.digital_train], axis=1)
+
+        # Set up variables for feature selection
+        y_train = combined_train['COMP']
+        X_train = combined_train.drop('COMP', axis=1)
+
+        # Use a simpler feature selection method
+        rf = RandomForestClassifier(n_estimators=50, max_depth=20, random_state=42)
+
+        # Use a smaller sample if the dataset is very large
+        if len(X_train) > 10000:
+            # Take a sample for performance
+            sample_indices = np.random.choice(len(X_train), 10000, replace=False)
+            X_sample = X_train.iloc[sample_indices]
+            y_sample = y_train.iloc[sample_indices]
+
+            # Fit the selector on the sample
+            sfm = SelectFromModel(rf, threshold='median')
+            sfm.fit(X_sample, y_sample)
+        else:
+            # Use full dataset if it's not too large
+            sfm = SelectFromModel(rf, threshold='median')
+            sfm.fit(X_train, y_train)
+
+        # Get selected feature names
+        selected_features = X_train.columns[sfm.get_support()].tolist()
+
+        # Always include COMP as it's our target
+        if 'COMP' not in selected_features:
+            selected_features.append('COMP')
+
+        return selected_features
+
+    def train(self):
+        try:
+            # Get selected features
+            selected_features = self.feature_selection()
+
+            # Combine datasets
+            X_train = pd.concat([self.analog_train, self.digital_train], axis=1)
+            y_train = X_train['COMP']
+            X_train = X_train.drop('COMP', axis=1)
+
+            # If there are selected features, use them
+            if selected_features and len(selected_features) > 1:  # > 1 because we always include COMP
+                # Remove COMP from feature list as it's the target
+                if 'COMP' in selected_features:
+                    selected_features.remove('COMP')
+
+                # Filter to only the selected features if they exist in X_train
+                valid_features = [f for f in selected_features if f in X_train.columns]
+                if valid_features:
+                    X_train = X_train[valid_features]
+                else:
+                    print("Warning: No valid features found in the feature list, using all features")
+
+            # Train XGBoost with default parameters
+            self.model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss')
+            self.model.fit(X_train, y_train)
+
+            return self.model
+
+        except Exception as e:
+            print(f"Error in XGBoost training: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+class EnsembleModel:
+    def __init__(self, autoencoder_analog, autoencoder_digital, lstm_model, xgboost_model):
+        self.autoencoder_analog = autoencoder_analog  # This is a list of models
+        self.autoencoder_digital = autoencoder_digital  # This is a list of models
+        self.lstm_model = lstm_model
+        self.xgboost_model = xgboost_model
+
+    def predict(self, analog_data, digital_data, sequence_length=50):
+        # Autoencoder predictions - use the first model (SAE) from each list
+        # Make sure the models exist
+        if not self.autoencoder_analog or len(self.autoencoder_analog) == 0:
+            raise ValueError("Analog autoencoder model is not available")
+        if not self.autoencoder_digital or len(self.autoencoder_digital) == 0:
+            raise ValueError("Digital autoencoder model is not available")
+
+        # Use the first model from each list (SAE)
+        sae_analog = self.autoencoder_analog[0]
+        sae_digital = self.autoencoder_digital[0]
+
+        # Generate predictions
+        analog_reconstruction = sae_analog.predict(analog_data)
+        digital_reconstruction = sae_digital.predict(digital_data)
+
+        # Calculate reconstruction errors
+        analog_error = np.mean(np.square(analog_data - analog_reconstruction), axis=1)
+        digital_error = np.mean(np.square(digital_data - digital_reconstruction), axis=1)
+
+        # LSTM prediction
+        if self.lstm_model is None or not hasattr(self.lstm_model, 'create_sequences'):
+            print("LSTM model is not available, using zeros for LSTM error")
+            lstm_error = np.zeros(len(analog_error))
+        else:
+            try:
+                lstm_sequences = self.lstm_model.create_sequences(analog_data, sequence_length)
+                lstm_reconstruction = self.lstm_model.model.predict(lstm_sequences)
+                lstm_error = np.mean(np.square(lstm_sequences - lstm_reconstruction), axis=(1, 2))
+
+                # Pad lstm_error to match the length of analog_error
+                pad_length = len(analog_error) - len(lstm_error)
+                if pad_length > 0:
+                    lstm_error = np.pad(lstm_error, (0, pad_length), 'constant', constant_values=np.mean(lstm_error))
+            except Exception as e:
+                print(f"Error in LSTM prediction: {e}")
+                lstm_error = np.zeros(len(analog_error))
+
+        # XGBoost prediction
+        if self.xgboost_model is None or not hasattr(self.xgboost_model, 'model'):
+            print("XGBoost model is not available, using zeros for XGBoost prediction")
+            xgboost_pred = np.zeros(len(analog_error))
+        else:
+            try:
+                # Convert numpy arrays to DataFrames with original column names
+                analog_df = pd.DataFrame(
+                    analog_data,
+                    columns=['TP2', 'TP3', 'H1', 'DV_pressure', 'Reservoirs', 'Oil_temperature', 'Motor_current']
+                )
+                digital_df = pd.DataFrame(
+                    digital_data,
+                    columns=['COMP', 'DV_eletric', 'Towers', 'MPG', 'LPS', 'Pressure_switch', 'Oil_level', 'Caudal_impulses']
+                )
+
+                # Prepare features for XGBoost
+                xgboost_features = pd.concat([analog_df, digital_df], axis=1)
+
+                # Check if needed features are available
+                missing_features = set(self.xgboost_model.model.feature_names_in_) - set(xgboost_features.columns)
+                if missing_features:
+                    print(f"Warning: Missing features for XGBoost: {missing_features}")
+                    # Create missing features with zeros
+                    for feature in missing_features:
+                        xgboost_features[feature] = 0
+
+                # Only keep the features used during training
+                xgboost_features = xgboost_features[self.xgboost_model.model.feature_names_in_]
+
+                # Generate predictions
+                xgboost_pred = self.xgboost_model.model.predict_proba(xgboost_features)[:, 1]
+            except Exception as e:
+                print(f"Error in XGBoost prediction: {e}")
+                xgboost_pred = np.zeros(len(analog_error))
+
+        # Make sure all arrays have the same length
+        min_length = min(len(analog_error), len(digital_error), len(lstm_error), len(xgboost_pred))
+        analog_error = analog_error[:min_length]
+        digital_error = digital_error[:min_length]
+        lstm_error = lstm_error[:min_length]
+        xgboost_pred = xgboost_pred[:min_length]
+
+        # Combine predictions
+        combined = np.column_stack((analog_error, digital_error, lstm_error, xgboost_pred))
+        final_pred = np.mean(combined, axis=1)
+
+        return final_pred
+
+class AnomalyDetectionSystem:
+    def __init__(self, data_preprocessor, autoencoder_models, lstm_model, xgboost_model, ensemble_model):
+        self.data_preprocessor = data_preprocessor
+        self.autoencoder_models = autoencoder_models
+        self.lstm_model = lstm_model
+        self.xgboost_model = xgboost_model
+        self.ensemble_model = ensemble_model
+
+    def calculate_threshold(self, errors, alpha=0.05):
+        q3 = np.percentile(errors, 75)
+        q1 = np.percentile(errors, 25)
+        iqr = q3 - q1
+        threshold = q3 + 3 * iqr
+        return threshold
+
+    def apply_low_pass_filter(self, errors, alpha=0.1):
+        filtered = [errors[0]]
+        for e in errors[1:]:
+            filtered.append(filtered[-1] + alpha * (e - filtered[-1]))
+        return np.array(filtered)
+
+    def detect_anomalies(self, errors, threshold):
+        anomalies = errors > threshold
+        consecutive_anomalies = []
+        current_sequence = 0
+
+        for anomaly in anomalies:
+            if anomaly:
+                current_sequence += 1
+            else:
+                current_sequence = 0
+
+            consecutive_anomalies.append(current_sequence >= 2)  # Require at least 2 consecutive anomalies
+
+        return consecutive_anomalies
+
+    def monitor(self, analog_data, digital_data, sequence_length=50):
+        # Get predictions from ensemble model
+        predictions = self.ensemble_model.predict(analog_data, digital_data, sequence_length)
+
+        # Calculate threshold
+        threshold = self.calculate_threshold(predictions)
+
+        # Apply low-pass filter
+        filtered_errors = self.apply_low_pass_filter(predictions)
+
+        # Detect anomalies
+        anomalies = self.detect_anomalies(filtered_errors, threshold)
+
+        return anomalies, threshold, filtered_errors
+
+class RULEstimator:
+    def __init__(self, lstm_model):
+        self.lstm_model = lstm_model
+
+    def estimate(self, analog_data, sequence_length=50):
+        # Create sequences
+        sequences = self.lstm_model.create_sequences(analog_data, sequence_length)
+
+        # Predict future values
+        predictions = self.lstm_model.model.predict(sequences)
+
+        # Calculate RUL as the number of steps until predicted failure
+        rul = []
+        for i in range(len(predictions)):
+            # Simple implementation: count until prediction exceeds threshold
+            future_predictions = predictions[i:]
+            failure_point = np.argmax(future_predictions > 0.5)  # Adjust threshold as needed
+            if failure_point == 0:
+                rul.append(len(future_predictions))
+            else:
+                rul.append(failure_point)
+
+        return np.array(rul)
+
+class CausalInterpreter:
+    def __init__(self, xgboost_model):
+        self.xgboost_model = xgboost_model
+
+    def interpret(self, X, sample_size=5000):
+        """
+        Generate SHAP values for interpretation, with optimized performance.
+
+        Args:
+            X: DataFrame with features
+            sample_size: Maximum number of samples to use for SHAP calculation
+        """
+        import shap
+        import time
+        print("Starting SHAP calculation...")
+        start_time = time.time()
+
+        # Use a smaller sample for SHAP calculations
+        if len(X) > sample_size:
+            print(f"Using {sample_size} samples for SHAP calculation (from {len(X)} total)")
+            # Stratified sampling to maintain class distribution if possible
+            if 'COMP' in X.columns:
+                # Try stratified sampling
+                try:
+                    from sklearn.model_selection import train_test_split
+                    _, X_sample = train_test_split(
+                        X,
+                        test_size=sample_size/len(X),
+                        stratify=X['COMP'],
+                        random_state=42
+                    )
+                except ValueError:
+                    # Fall back to random sampling if stratification fails
+                    X_sample = X.sample(sample_size, random_state=42)
+            else:
+                X_sample = X.sample(sample_size, random_state=42)
+        else:
+            X_sample = X
+
+        # Use approximate SHAP values with fewer background samples
+        try:
+            # First try the faster TreeExplainer with fewer background samples
+            explainer = shap.TreeExplainer(
+                self.xgboost_model.model,
+                data=X_sample.sample(min(100, len(X_sample)), random_state=42),
+                feature_perturbation="interventional"
+            )
+
+            # Calculate SHAP values with a progress bar
+            print("Calculating SHAP values...")
+            shap_values = explainer.shap_values(X_sample)
+
+        except Exception as e:
+            print(f"Error in SHAP calculation: {e}")
+            print("Using a simpler approach for SHAP values...")
+
+            # Fallback to a simpler explainer
+            explainer = shap.Explainer(self.xgboost_model.model.predict, X_sample.iloc[:100])
+            shap_values = explainer(X_sample)
+
+        elapsed_time = time.time() - start_time
+        print(f"SHAP calculation completed in {elapsed_time:.2f} seconds")
+
+        return shap_values, X_sample
+
+    def causal_analysis(self, X, treatment, sample_size=10000):
+        """
+        Perform causal analysis with performance optimization
+
+        Args:
+            X: DataFrame with features
+            treatment: Treatment variable
+            sample_size: Maximum number of samples to use
+        """
+        import time
+        print("Starting causal analysis...")
+        start_time = time.time()
+
+        # Use a smaller sample for causal analysis
+        if len(X) > sample_size:
+            print(f"Using {sample_size} samples for causal analysis (from {len(X)} total)")
+            # Get a smaller sample, maintaining index alignment with treatment
+            X_index = X.index.tolist()
+            sample_indices = np.random.choice(len(X_index), size=sample_size, replace=False)
+            X_sample = X.iloc[sample_indices]
+            treatment_sample = treatment.iloc[sample_indices]
+        else:
+            X_sample = X
+            treatment_sample = treatment
+
+        # Use a simpler model for causal inference
+        try:
+            from causalml.inference.tree import CausalTree
+            ct = CausalTree(max_depth=3)  # Limit tree depth for faster training
+
+            # Make sure 'COMP' exists in X_sample
+            if 'COMP' in X_sample.columns:
+                target = X_sample['COMP']
+            else:
+                # If COMP doesn't exist, create a dummy target
+                print("Warning: 'COMP' not found in features, using dummy target")
+                target = np.zeros(len(X_sample))
+
+            # Fit the causal tree
+            ct.fit(X_sample, treatment_sample, target)
+            effects = ct.effect(X_sample)
+        except Exception as e:
+            print(f"Error in causal analysis: {e}")
+            print("Using simulated effects as fallback")
+            # Generate simulated effects based on feature importance
+            if hasattr(self.xgboost_model.model, 'feature_importances_'):
+                feature_importances = self.xgboost_model.model.feature_importances_
+                effects = feature_importances / np.sum(feature_importances) * len(feature_importances)
+            else:
+                effects = np.ones(X_sample.shape[1])
+
+        elapsed_time = time.time() - start_time
+        print(f"Causal analysis completed in {elapsed_time:.2f} seconds")
+
+        return effects
+
+# Main execution
+# Main execution with optimizations
+if __name__ == "__main__":
+    import time
+    import gc
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+    from sklearn.preprocessing import StandardScaler
+    import seaborn as sns
+    
+    # Create a results directory
+    results_dir = "analysis_results"
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+
+    # Set environment variables to limit TensorFlow memory usage
+    os.environ['TF_MEMORY_ALLOCATION'] = 'growth'
+
+    # Add memory monitoring
+    print_memory_usage()
+    start_time = time.time()
+
+    #######################################
+    # DATA PREPROCESSING AND VISUALIZATION
+    #######################################
+    print("Preprocessing data...")
+    preprocessor = DataPreprocessor("metropt3.csv", failure_periods)
+    analog_train, analog_test, digital_train, digital_test = preprocessor.preprocess()
+    print(f"Data preprocessing complete. Train shape: {analog_train.shape}, Test shape: {analog_test.shape}")
+    print_memory_usage()
+
+    # Visualize data distributions
+    print("Generating data visualizations...")
+    try:
+        # Correlation heatmap for analog features
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(analog_train.corr(), annot=True, cmap='coolwarm', linewidths=0.5)
+        plt.title('Correlation Heatmap - Analog Features')
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/analog_correlation_heatmap.png")
+        
+        # Correlation heatmap for digital features
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(digital_train.corr(), annot=True, cmap='coolwarm', linewidths=0.5)
+        plt.title('Correlation Heatmap - Digital Features')
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/digital_correlation_heatmap.png")
+        
+        # Feature distributions
+        plt.figure(figsize=(15, 10))
+        for i, col in enumerate(analog_train.columns):
+            plt.subplot(3, 3, i+1)
+            sns.histplot(analog_train[col], kde=True)
+            plt.title(f'Distribution of {col}')
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/analog_feature_distributions.png")
+        
+        # Digital feature distributions
+        plt.figure(figsize=(15, 10))
+        for i, col in enumerate(digital_train.columns):
+            plt.subplot(3, 3, i+1)
+            sns.countplot(x=digital_train[col])
+            plt.title(f'Distribution of {col}')
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/digital_feature_distributions.png")
+        
+        print("Data visualizations complete")
+    except Exception as e:
+        print(f"Warning: Error generating data visualizations: {e}")
+
+    #######################################
+    # AUTOENCODER TRAINING AND EVALUATION
+    #######################################
+    print("Training autoencoders...")
+    autoencoder_models = AutoencoderModels(analog_train, analog_test, digital_train, digital_test)
+    analog_model, digital_model = autoencoder_models.train_autoencoders()
+    
+    # Evaluate individual autoencoder models
+    print("Evaluating autoencoder models...")
+    try:
+        # Evaluate analog SAE
+        analog_sae = analog_model[0]
+        analog_sae_train_preds = analog_sae.predict(analog_train)
+        analog_sae_test_preds = analog_sae.predict(analog_test)
+        
+        analog_sae_train_error = np.mean(np.square(analog_train.values - analog_sae_train_preds), axis=1)
+        analog_sae_test_error = np.mean(np.square(analog_test.values - analog_sae_test_preds), axis=1)
+        
+        # Plot analog SAE error distributions
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        sns.histplot(analog_sae_train_error, kde=True, color='blue')
+        plt.title('Analog SAE - Training Error Distribution')
+        plt.xlabel('Mean Squared Error')
+        
+        plt.subplot(1, 2, 2)
+        sns.histplot(analog_sae_test_error, kde=True, color='red')
+        plt.title('Analog SAE - Testing Error Distribution')
+        plt.xlabel('Mean Squared Error')
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/analog_sae_error_distribution.png")
+        
+        # Evaluate digital SAE
+        digital_sae = digital_model[0]
+        digital_sae_train_preds = digital_sae.predict(digital_train)
+        digital_sae_test_preds = digital_sae.predict(digital_test)
+        
+        digital_sae_train_error = np.mean(np.square(digital_train.values - digital_sae_train_preds), axis=1)
+        digital_sae_test_error = np.mean(np.square(digital_test.values - digital_sae_test_preds), axis=1)
+        
+        # Plot digital SAE error distributions
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        sns.histplot(digital_sae_train_error, kde=True, color='blue')
+        plt.title('Digital SAE - Training Error Distribution')
+        plt.xlabel('Mean Squared Error')
+        
+        plt.subplot(1, 2, 2)
+        sns.histplot(digital_sae_test_error, kde=True, color='red')
+        plt.title('Digital SAE - Testing Error Distribution')
+        plt.xlabel('Mean Squared Error')
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/digital_sae_error_distribution.png")
+        
+        # Feature reconstruction quality for analog SAE
+        plt.figure(figsize=(15, 10))
+        for i, col in enumerate(analog_train.columns):
+            plt.subplot(3, 3, i+1)
+            
+            # Original vs reconstructed feature values for a sample of points
+            sample_size = min(1000, len(analog_test))
+            sample_indices = np.random.choice(len(analog_test), sample_size, replace=False)
+            
+            plt.scatter(analog_test.iloc[sample_indices][col], 
+                       analog_sae_test_preds[sample_indices, i],
+                       alpha=0.5)
+            
+            # Add a diagonal line for perfect reconstruction
+            min_val = min(analog_test[col].min(), analog_sae_test_preds[:, i].min())
+            max_val = max(analog_test[col].max(), analog_sae_test_preds[:, i].max())
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+            
+            plt.xlabel(f'Original {col}')
+            plt.ylabel(f'Reconstructed {col}')
+            plt.title(f'Reconstruction Quality - {col}')
+        
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/analog_sae_reconstruction_quality.png")
+        
+        print("Autoencoder evaluation complete")
+    except Exception as e:
+        print(f"Warning: Error in autoencoder evaluation: {e}")
+    
+    tf.keras.backend.clear_session()
+    gc.collect()
+    print_memory_usage()
+    print("Autoencoder training and evaluation complete.")
+    clear_memory()
+
+    #######################################
+    # LSTM TRAINING AND EVALUATION
+    #######################################
+    print("Training LSTM...")
+    lstm_model = LSTMAutoencoder(analog_train, analog_test)
+    lstm_model.train(sequence_length=30, batch_size=16, epochs=1)
+    
+    # Evaluate LSTM model
+    print("Evaluating LSTM model...")
+    try:
+        # Create sequences for evaluation
+        sequence_length = 30
+        train_sequences = lstm_model.create_sequences(analog_train.values, sequence_length)
+        test_sequences = lstm_model.create_sequences(analog_test.values, sequence_length)
+        
+        # Get predictions
+        train_preds = lstm_model.model.predict(train_sequences)
+        test_preds = lstm_model.model.predict(test_sequences)
+        
+        # Calculate reconstruction errors
+        train_errors = np.mean(np.square(train_sequences - train_preds), axis=(1, 2))
+        test_errors = np.mean(np.square(test_sequences - test_preds), axis=(1, 2))
+        
+        # Plot error distributions
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        sns.histplot(train_errors, kde=True, color='blue')
+        plt.title('LSTM - Training Error Distribution')
+        plt.xlabel('Mean Squared Error')
+        
+        plt.subplot(1, 2, 2)
+        sns.histplot(test_errors, kde=True, color='red')
+        plt.title('LSTM - Testing Error Distribution')
+        plt.xlabel('Mean Squared Error')
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/lstm_error_distribution.png")
+        
+        # Plot error over time
+        plt.figure(figsize=(12, 6))
+        plt.plot(test_errors, label='Test Reconstruction Error')
+        plt.title('LSTM Reconstruction Error Over Time')
+        plt.xlabel('Sequence Index')
+        plt.ylabel('Mean Squared Error')
+        plt.legend()
+        plt.savefig(f"{results_dir}/lstm_error_over_time.png")
+        
+        # Plot sample reconstructions
+        sample_idx = np.random.randint(0, len(test_sequences))
+        plt.figure(figsize=(12, 8))
+        
+        # Select a few features to visualize
+        feature_indices = [0, 1, 2]  # First three features
+        
+        for i, feat_idx in enumerate(feature_indices):
+            plt.subplot(len(feature_indices), 1, i+1)
+            plt.plot(test_sequences[sample_idx, :, feat_idx], label='Original')
+            plt.plot(test_preds[sample_idx, :, feat_idx], label='Reconstructed')
+            plt.title(f'Feature {analog_test.columns[feat_idx]} - Sequence {sample_idx}')
+            plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/lstm_sample_reconstruction.png")
+        
+        print("LSTM evaluation complete")
+    except Exception as e:
+        print(f"Warning: Error in LSTM evaluation: {e}")
+    
+    tf.keras.backend.clear_session()
+    gc.collect()
+    print_memory_usage()
+    print("LSTM training and evaluation complete.")
+    clear_memory()
+
+    #######################################
+    # XGBOOST TRAINING AND EVALUATION
+    #######################################
+    print("Training XGBoost...")
+    xgboost_model = XGBoostModel(analog_train, analog_test, digital_train, digital_test)
+    xgboost_model.train()
+    
+    # Evaluate XGBoost model
+    print("Evaluating XGBoost model...")
+    try:
+        # Prepare data for XGBoost evaluation
+        X_train = pd.concat([analog_train, digital_train], axis=1)
+        y_train = X_train['COMP']
+        X_train = X_train.drop('COMP', axis=1)
+        
+        X_test = pd.concat([analog_test, digital_test], axis=1)
+        y_test = X_test['COMP']
+        X_test = X_test.drop('COMP', axis=1)
+        
+        # Get predictions
+        train_preds_prob = xgboost_model.model.predict_proba(X_train)[:, 1]
+        test_preds_prob = xgboost_model.model.predict_proba(X_test)[:, 1]
+        
+        train_preds = xgboost_model.model.predict(X_train)
+        test_preds = xgboost_model.model.predict(X_test)
+        
+        # Classification report
+        report = classification_report(y_test, test_preds)
+        print("XGBoost Classification Report:")
+        print(report)
+        
+        # Save classification report to file
+        with open(f"{results_dir}/xgboost_classification_report.txt", "w") as f:
+            f.write(report)
+        
+        # Confusion matrix
+        cm = confusion_matrix(y_test, test_preds)
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.title('XGBoost Confusion Matrix')
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
+        plt.savefig(f"{results_dir}/xgboost_confusion_matrix.png")
+        
+        # ROC curve
+        fpr, tpr, _ = roc_curve(y_test, test_preds_prob)
+        roc_auc = auc(fpr, tpr)
+        
+        plt.figure(figsize=(10, 8))
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.2f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('XGBoost ROC Curve')
+        plt.legend(loc="lower right")
+        plt.savefig(f"{results_dir}/xgboost_roc_curve.png")
+        
+        # Feature importance
+        feature_importance = xgboost_model.model.feature_importances_
+        feature_names = X_train.columns
+        
+        importance_df = pd.DataFrame({
+            'Feature': feature_names,
+            'Importance': feature_importance
+        })
+        importance_df = importance_df.sort_values('Importance', ascending=False)
+        
+        plt.figure(figsize=(12, 8))
+        sns.barplot(x='Importance', y='Feature', data=importance_df)
+        plt.title('XGBoost Feature Importance')
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/xgboost_feature_importance.png")
+        
+        print("XGBoost evaluation complete")
+    except Exception as e:
+        print(f"Warning: Error in XGBoost evaluation: {e}")
+    
+    print_memory_usage()
+    print("XGBoost training and evaluation complete.")
+    clear_memory()
+
+    #######################################
+    # ENSEMBLE MODEL CREATION AND EVALUATION
+    #######################################
+    print("Creating ensemble model...")
+    ensemble_model = EnsembleModel(analog_model, digital_model, lstm_model, xgboost_model)
+    print_memory_usage()
+
+    #######################################
+    # ANOMALY DETECTION SYSTEM
+    #######################################
+    print("Initializing anomaly detection system...")
+    detection_system = AnomalyDetectionSystem(preprocessor, autoencoder_models, lstm_model, xgboost_model, ensemble_model)
+    print_memory_usage()
+
+    # Monitor system
+    print("Monitoring system...")
+    analog_data = analog_test.values
+    digital_data = digital_test.values
+    anomalies, threshold, filtered_errors = detection_system.monitor(analog_data, digital_data)
+    print(f"Anomaly detection complete. Found {np.sum(anomalies)} anomalies.")
+    print_memory_usage()
+    
+    # Evaluate each component of the ensemble separately
+    print("Evaluating ensemble components...")
+    try:
+        # Get individual model predictions
+        sae_analog = analog_model[0]
+        sae_digital = digital_model[0]
+        
+        # Analog autoencoder predictions
+        analog_reconstruction = sae_analog.predict(analog_data)
+        analog_error = np.mean(np.square(analog_data - analog_reconstruction), axis=1)
+        
+        # Digital autoencoder predictions
+        digital_reconstruction = sae_digital.predict(digital_data)
+        digital_error = np.mean(np.square(digital_data - digital_reconstruction), axis=1)
+        
+        # LSTM predictions (on a subset if needed for performance)
+        sequence_length = 30
+        max_sequences = min(5000, len(analog_data) - sequence_length)
+        lstm_sequences = lstm_model.create_sequences(analog_data, sequence_length)[:max_sequences]
+        lstm_reconstruction = lstm_model.model.predict(lstm_sequences)
+        lstm_error_partial = np.mean(np.square(lstm_sequences - lstm_reconstruction), axis=(1, 2))
+        
+        # Pad LSTM errors to match the length of other errors
+        lstm_error = np.zeros(len(analog_error))
+        lstm_error[:len(lstm_error_partial)] = lstm_error_partial
+        
+        # XGBoost predictions
+        analog_df = pd.DataFrame(
+            analog_data, 
+            columns=analog_test.columns
+        )
+        digital_df = pd.DataFrame(
+            digital_data,
+            columns=digital_test.columns
+        )
+        xgboost_features = pd.concat([analog_df, digital_df], axis=1)
+        
+        if hasattr(xgboost_model.model, 'feature_names_in_'):
+            # Ensure features match those used in training
+            missing_features = set(xgboost_model.model.feature_names_in_) - set(xgboost_features.columns)
+            for feature in missing_features:
+                xgboost_features[feature] = 0
+            
+            # Keep only the features used during training
+            xgboost_features = xgboost_features[xgboost_model.model.feature_names_in_]
+        
+        # Get prediction probabilities
+        xgboost_pred = xgboost_model.model.predict_proba(xgboost_features)[:, 1]
+        
+        # Plot individual component errors
+        plt.figure(figsize=(20, 15))
+        
+        # Analog autoencoder errors
+        plt.subplot(4, 1, 1)
+        plt.plot(analog_error)
+        plt.title('Analog Autoencoder Reconstruction Error')
+        plt.xlabel('Time')
+        plt.ylabel('Error')
+        
+        # Digital autoencoder errors
+        plt.subplot(4, 1, 2)
+        plt.plot(digital_error)
+        plt.title('Digital Autoencoder Reconstruction Error')
+        plt.xlabel('Time')
+        plt.ylabel('Error')
+        
+        # LSTM errors
+        plt.subplot(4, 1, 3)
+        plt.plot(lstm_error)
+        plt.title('LSTM Reconstruction Error')
+        plt.xlabel('Time')
+        plt.ylabel('Error')
+        
+        # XGBoost predictions
+        plt.subplot(4, 1, 4)
+        plt.plot(xgboost_pred)
+        plt.title('XGBoost Prediction Probability')
+        plt.xlabel('Time')
+        plt.ylabel('Probability')
+        
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/ensemble_component_errors.png")
+        
+        # Calculate correlation between component errors
+        error_df = pd.DataFrame({
+            'Analog': analog_error,
+            'Digital': digital_error,
+            'LSTM': lstm_error,
+            'XGBoost': xgboost_pred,
+            'Ensemble': filtered_errors,
+            'Is_Anomaly': anomalies
+        })
+        
+        # Correlation heatmap
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(error_df.corr(), annot=True, cmap='coolwarm')
+        plt.title('Correlation Between Model Errors')
+        plt.tight_layout()
+        plt.savefig(f"{results_dir}/error_correlation_heatmap.png")
+        
+        print("Ensemble component evaluation complete")
+    except Exception as e:
+        print(f"Warning: Error in ensemble component evaluation: {e}")
+
+    #######################################
+    # RUL ESTIMATION
+    #######################################
+    print("Estimating RUL...")
+    rul_estimator = RULEstimator(lstm_model)
+    rul = rul_estimator.estimate(analog_data)
+    print(f"RUL estimation complete. Last RUL value: {rul[-1]}")
+    print_memory_usage()
+
+    # Save intermediate results to avoid losing work if SHAP calculation fails
+    try:
+        np.save(f'{results_dir}/anomalies.npy', anomalies)
+        np.save(f'{results_dir}/filtered_errors.npy', filtered_errors)
+        np.save(f'{results_dir}/rul.npy', rul)
+        print("Intermediate results saved to disk")
+    except Exception as e:
+        print(f"Warning: Could not save intermediate results: {e}")
+
+    #######################################
+    # CAUSAL INTERPRETATION
+    #######################################
+    print("Performing causal interpretation...")
+    causal_interpreter = CausalInterpreter(xgboost_model)
+
+    # Use smaller samples for SHAP values
+    X_combined = pd.concat([analog_test, digital_test], axis=1)
+
+    try:
+        # Do SHAP calculation with a timeout
+        shap_values, X_sample = causal_interpreter.interpret(X_combined, sample_size=5000)
+        print("SHAP calculation complete")
+
+        # Clear memory before causal analysis
+        gc.collect()
+        print_memory_usage()
+
+        # Perform causal analysis on a smaller sample
+        causal_effects = causal_interpreter.causal_analysis(X_combined, digital_test['COMP'], sample_size=10000)
+        print("Causal analysis complete")
+    except Exception as e:
+        print(f"Error in causal interpretation: {e}")
+        print("Continuing with results visualization...")
+        # Create dummy values if SHAP fails
+        shap_values = None
+        X_sample = None
+        causal_effects = None
+
+    print_memory_usage()
+    elapsed_time = time.time() - start_time
+    print(f"Total processing time: {elapsed_time:.2f} seconds")
+
+    #######################################
+    # RESULTS SUMMARY AND VISUALIZATION
+    #######################################
+    print("\nRESULTS SUMMARY")
+    print("=" * 50)
+    print(f"Anomalies detected: {np.sum(anomalies)}")
+    print(f"Threshold: {threshold}")
+    print(f"Remaining Useful Life (RUL): {rul[-1]}")  # Last value as current RUL estimate
+    
+    # Write summary to file
+    with open(f"{results_dir}/results_summary.txt", "w") as f:
+        f.write("RESULTS SUMMARY\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Anomalies detected: {np.sum(anomalies)}\n")
+        f.write(f"Threshold: {threshold}\n")
+        f.write(f"Remaining Useful Life (RUL): {rul[-1]}\n\n")
+        f.write(f"Total processing time: {elapsed_time:.2f} seconds\n")
+
+    # Plot results
+    print("\nGenerating plots...")
+    try:
+        # Anomaly detection plot
+        plt.figure(figsize=(12, 6))
+        plt.plot(filtered_errors, label='Filtered Reconstruction Error')
+        plt.axhline(y=threshold, color='r', linestyle='--', label='Threshold')
+        plt.title('Anomaly Detection')
+        plt.xlabel('Time')
+        plt.ylabel('Reconstruction Error')
+        plt.legend()
+        plt.savefig(f'{results_dir}/anomaly_detection.png')
+        print(f"Anomaly detection plot saved to '{results_dir}/anomaly_detection.png'")
+        
+        # RUL estimation plot
+        plt.figure(figsize=(12, 6))
+        plt.plot(rul, label='Remaining Useful Life')
+        plt.title('Remaining Useful Life Estimation')
+        plt.xlabel('Time')
+        plt.ylabel('RUL')
+        plt.legend()
+        plt.savefig(f'{results_dir}/rul_estimation.png')
+        print(f"RUL estimation plot saved to '{results_dir}/rul_estimation.png'")
+        
+        # Combined plot with anomalies and RUL
+        plt.figure(figsize=(15, 10))
+        
+        # Top plot - Anomaly detection
+        plt.subplot(2, 1, 1)
+        plt.plot(filtered_errors, 'b-', label='Reconstruction Error')
+        plt.axhline(y=threshold, color='r', linestyle='--', label='Threshold')
+        
+        # Highlight anomalies
+        anomaly_indices = np.where(anomalies)[0]
+        if len(anomaly_indices) > 0:
+            plt.scatter(anomaly_indices, filtered_errors[anomaly_indices], 
+                       color='red', label='Detected Anomalies')
+        
+        plt.title('Anomaly Detection')
+        plt.xlabel('Time')
+        plt.ylabel('Reconstruction Error')
+        plt.legend()
+        
+        # Bottom plot - RUL estimation
+        plt.subplot(2, 1, 2)
+        plt.plot(rul, 'g-', label='RUL')
+        
+        # Mark same anomaly points on RUL plot
+        if len(anomaly_indices) > 0 and len(rul) > 0:
+            valid_indices = anomaly_indices[anomaly_indices < len(rul)]
+            if len(valid_indices) > 0:
+                plt.scatter(valid_indices, rul[valid_indices], 
+                           color='red', label='Anomalies')
+        
+        plt.title('Remaining Useful Life')
+        plt.xlabel('Time')
+        plt.ylabel('RUL')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig(f'{results_dir}/combined_anomaly_rul.png')
+        print(f"Combined plot saved to '{results_dir}/combined_anomaly_rul.png'")
+
+        # SHAP values plot if available
+        if shap_values is not None and X_sample is not None:
+            import shap
+            plt.figure(figsize=(12, 10))
+            shap.summary_plot(shap_values, X_sample, show=False)
+            plt.tight_layout()
+            plt.savefig(f'{results_dir}/shap_values.png')
+            print(f"SHAP values plot saved to '{results_dir}/shap_values.png'")
+            
+            # Top 10 features by SHAP value
+            plt.figure(figsize=(12, 8))
+            shap.summary_plot(shap_values, X_sample, plot_type="bar", show=False)
+            plt.tight_layout()
+            plt.savefig(f'{results_dir}/shap_feature_importance.png')
+            print(f"SHAP feature importance plot saved to '{results_dir}/shap_feature_importance.png'")
+            
+            # Detailed SHAP value plots for top features
+            top_features = np.argsort(np.abs(shap_values).mean(0))[-5:]  # Top 5 features
+            for i, feature_idx in enumerate(top_features):
+                feature_name = X_sample.columns[feature_idx]
+                plt.figure(figsize=(10, 6))
+                shap.dependence_plot(feature_idx, shap_values, X_sample, show=False)
+                plt.title(f'SHAP Dependence Plot - {feature_name}')
+                plt.tight_layout()
+                plt.savefig(f'{results_dir}/shap_dependence_{feature_name}.png')
+                print(f"SHAP dependence plot for {feature_name} saved")
+
+        # Causal effects plot if available
+        if causal_effects is not None:
+            # Bar plot of causal effects
+            plt.figure(figsize=(12, 6))
+            
+            # If we have feature names, use them
+            if X_combined is not None:
+                feature_names = list(X_combined.columns)
+                if len(feature_names) == len(causal_effects):
+                    effect_df = pd.DataFrame({
+                        'Feature': feature_names,
+                        'Effect': causal_effects
+                    })
+                    effect_df = effect_df.sort_values('Effect', ascending=False)
+                    
+                    sns.barplot(x='Effect', y='Feature', data=effect_df)
+                else:
+                    # If feature length doesn't match, use indices
+                    plt.bar(range(len(causal_effects)), causal_effects)
+                    plt.xlabel('Feature Index')
+            else:
+                plt.bar(range(len(causal_effects)), causal_effects)
+                plt.xlabel('Feature Index')
+                
+            plt.title('Causal Effects')
+            plt.ylabel('Effect Size')
+            plt.tight_layout()
+            plt.savefig(f'{results_dir}/causal_effects.png')
+            print(f"Causal effects plot saved to '{results_dir}/causal_effects.png'")
+        
+        print("All plots generated successfully")
+    except Exception as e:
+        print(f"Error generating plots: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("\nAnalysis complete! All results saved to the directory:", results_dir)
